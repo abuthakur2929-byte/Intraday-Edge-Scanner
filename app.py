@@ -1,175 +1,553 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
+from datetime import datetime
 
-st.set_page_config(page_title="Intraday Edge Scanner V1", page_icon="🎯", layout="wide")
+st.set_page_config(
+    page_title="Intraday Edge Scanner",
+    page_icon="🎯",
+    layout="wide"
+)
+
 st.title("🎯 Intraday Edge Scanner — V1")
-st.caption("Research / scanning only • No automatic order placement")
+st.caption("Live NSE research scanner • No automatic order placement")
 
-uploaded = st.file_uploader("Upload intraday OHLCV CSV", type=["csv"])
+# =========================================================
+# SETTINGS
+# =========================================================
 
-def ema(s, n):
-    return s.ewm(span=n, adjust=False).mean()
+UPSTOX_TOKEN = st.secrets.get("UPSTOX_ANALYTICS_TOKEN", "")
 
-def rsi(s, n=14):
-    d = s.diff()
-    gain = d.clip(lower=0).rolling(n).mean()
-    loss = (-d.clip(upper=0)).rolling(n).mean()
-    rs = gain / loss.replace(0, np.nan)
+# Major liquid NSE stocks for first live test
+STOCKS = {
+    "RELIANCE": "NSE_EQ|INE002A01018",
+    "HDFCBANK": "NSE_EQ|INE040A01034",
+    "ICICIBANK": "NSE_EQ|INE090A01021",
+    "SBIN": "NSE_EQ|INE062A01020",
+    "INFY": "NSE_EQ|INE009A01021",
+    "TCS": "NSE_EQ|INE467B01029",
+    "ITC": "NSE_EQ|INE154A01025",
+    "LT": "NSE_EQ|INE018A01030",
+    "AXISBANK": "NSE_EQ|INE238A01034",
+    "BHARTIARTL": "NSE_EQ|INE397D01024",
+    "KOTAKBANK": "NSE_EQ|INE237A01028",
+    "MARUTI": "NSE585A01020",
+    "TATAMOTORS": "NSE_EQ|INE155A01022",
+    "SUNPHARMA": "NSE_EQ|INE044A01036",
+    "ADANIENT": "NSE_EQ|INE423A01024",
+}
+
+# =========================================================
+# INDICATORS
+# =========================================================
+
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+
     return 100 - (100 / (1 + rs))
 
-def atr(df, n=14):
-    prev = df["Close"].shift(1)
-    tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - prev).abs(),
-        (df["Low"] - prev).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(n).mean()
 
-def scan_symbol(g):
-    g = g.sort_values("Datetime").copy()
-    if len(g) < 220:
+def calculate_atr(df, period=14):
+    high_low = df["High"] - df["Low"]
+
+    high_close = (
+        df["High"] - df["Close"].shift()
+    ).abs()
+
+    low_close = (
+        df["Low"] - df["Close"].shift()
+    ).abs()
+
+    true_range = pd.concat(
+        [high_low, high_close, low_close],
+        axis=1
+    ).max(axis=1)
+
+    return true_range.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period
+    ).mean()
+
+
+def add_indicators(df):
+    df = df.copy()
+
+    df["EMA20"] = df["Close"].ewm(
+        span=20,
+        adjust=False
+    ).mean()
+
+    df["EMA50"] = df["Close"].ewm(
+        span=50,
+        adjust=False
+    ).mean()
+
+    df["EMA200"] = df["Close"].ewm(
+        span=200,
+        adjust=False
+    ).mean()
+
+    df["RSI14"] = calculate_rsi(
+        df["Close"],
+        14
+    )
+
+    df["ATR14"] = calculate_atr(
+        df,
+        14
+    )
+
+    df["AvgVol20"] = df["Volume"].rolling(
+        20
+    ).mean()
+
+    df["RVOL"] = (
+        df["Volume"] /
+        df["AvgVol20"].replace(0, np.nan)
+    )
+
+    # Intraday VWAP
+    typical_price = (
+        df["High"] +
+        df["Low"] +
+        df["Close"]
+    ) / 3
+
+    date_key = df["Datetime"].dt.date
+
+    cumulative_pv = (
+        typical_price * df["Volume"]
+    ).groupby(date_key).cumsum()
+
+    cumulative_volume = (
+        df["Volume"]
+        .groupby(date_key)
+        .cumsum()
+    )
+
+    df["VWAP"] = (
+        cumulative_pv /
+        cumulative_volume.replace(0, np.nan)
+    )
+
+    # Previous 20-bar high/low
+    df["Prev20High"] = (
+        df["High"]
+        .rolling(20)
+        .max()
+        .shift(1)
+    )
+
+    df["Prev20Low"] = (
+        df["Low"]
+        .rolling(20)
+        .min()
+        .shift(1)
+    )
+
+    df["Breakout"] = (
+        df["Close"] > df["Prev20High"]
+    )
+
+    df["Breakdown"] = (
+        df["Close"] < df["Prev20Low"]
+    )
+
+    return df
+
+
+# =========================================================
+# UPSTOX DATA
+# =========================================================
+
+def get_intraday_data(instrument_key, interval=5):
+    if not UPSTOX_TOKEN:
+        raise ValueError(
+            "UPSTOX_ANALYTICS_TOKEN is missing in Streamlit Secrets."
+        )
+
+    url = (
+        "https://api.upstox.com/v3/"
+        f"historical-candle/intraday/"
+        f"{instrument_key}/minutes/{interval}"
+    )
+
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {UPSTOX_TOKEN}"
+    }
+
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=20
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Upstox API error {response.status_code}: "
+            f"{response.text}"
+        )
+
+    payload = response.json()
+
+    candles = (
+        payload
+        .get("data", {})
+        .get("candles", [])
+    )
+
+    if not candles:
+        return pd.DataFrame()
+
+    rows = []
+
+    for candle in candles:
+        rows.append({
+            "Datetime": pd.to_datetime(candle[0]),
+            "Open": float(candle[1]),
+            "High": float(candle[2]),
+            "Low": float(candle[3]),
+            "Close": float(candle[4]),
+            "Volume": float(candle[5])
+        })
+
+    df = pd.DataFrame(rows)
+
+    df = df.sort_values(
+        "Datetime"
+    ).reset_index(drop=True)
+
+    return df
+
+
+# =========================================================
+# SCORING
+# =========================================================
+
+def scan_stock(symbol, instrument_key):
+    df = get_intraday_data(
+        instrument_key,
+        interval=5
+    )
+
+    if df.empty:
         return None
 
-    g["EMA20"] = ema(g["Close"], 20)
-    g["EMA50"] = ema(g["Close"], 50)
-    g["EMA200"] = ema(g["Close"], 200)
-    g["RSI"] = rsi(g["Close"], 14)
-    g["ATR"] = atr(g, 14)
-    g["AvgVol20"] = g["Volume"].rolling(20).mean()
-    g["RVOL"] = g["Volume"] / g["AvgVol20"].replace(0, np.nan)
+    if len(df) < 220:
+        return None
 
-    typical = (g["High"] + g["Low"] + g["Close"]) / 3
-    day = g["Datetime"].dt.date
-    g["TPV"] = typical * g["Volume"]
-    g["CumTPV"] = g.groupby(day)["TPV"].cumsum()
-    g["CumVol"] = g.groupby(day)["Volume"].cumsum()
-    g["VWAP"] = g["CumTPV"] / g["CumVol"].replace(0, np.nan)
+    df = add_indicators(df)
 
-    last = g.iloc[-1]
-    prev20_high = g["High"].shift(1).rolling(20).max().iloc[-1]
-    prev20_low = g["Low"].shift(1).rolling(20).min().iloc[-1]
+    latest = df.iloc[-1]
+
+    required = [
+        "EMA20",
+        "EMA50",
+        "EMA200",
+        "VWAP",
+        "RSI14",
+        "ATR14",
+        "RVOL"
+    ]
+
+    if any(
+        pd.isna(latest[x])
+        for x in required
+    ):
+        return None
 
     long_score = 0
     short_score = 0
-    long_reasons, short_reasons = [], []
 
-    if last["EMA20"] > last["EMA50"] > last["EMA200"]:
+    # Trend
+    if (
+        latest["EMA20"] >
+        latest["EMA50"] >
+        latest["EMA200"]
+    ):
         long_score += 20
-        long_reasons.append("EMA trend")
-    if last["EMA20"] < last["EMA50"] < last["EMA200"]:
+
+    if (
+        latest["EMA20"] <
+        latest["EMA50"] <
+        latest["EMA200"]
+    ):
         short_score += 20
-        short_reasons.append("EMA trend")
 
-    if last["Close"] > last["VWAP"]:
+    # VWAP
+    if latest["Close"] > latest["VWAP"]:
         long_score += 15
-        long_reasons.append("Above VWAP")
-    if last["Close"] < last["VWAP"]:
-        short_score += 15
-        short_reasons.append("Below VWAP")
 
-    if last["Close"] > prev20_high:
+    if latest["Close"] < latest["VWAP"]:
+        short_score += 15
+
+    # Breakout / Breakdown
+    if latest["Breakout"]:
         long_score += 25
-        long_reasons.append("20-bar breakout")
-    if last["Close"] < prev20_low:
-        short_score += 25
-        short_reasons.append("20-bar breakdown")
 
-    if last["RVOL"] >= 1.5:
+    if latest["Breakdown"]:
+        short_score += 25
+
+    # Relative Volume
+    if latest["RVOL"] >= 1.5:
         long_score += 15
         short_score += 15
-        long_reasons.append(f"RVOL {last['RVOL']:.1f}x")
-        short_reasons.append(f"RVOL {last['RVOL']:.1f}x")
 
-    if 55 <= last["RSI"] <= 75:
+    # RSI
+    if 55 <= latest["RSI14"] <= 75:
         long_score += 10
-        long_reasons.append("RSI momentum")
-    if 25 <= last["RSI"] <= 45:
-        short_score += 10
-        short_reasons.append("RSI momentum")
 
+    if 25 <= latest["RSI14"] <= 45:
+        short_score += 10
+
+    # Small confirmation baseline
     long_score += 5
     short_score += 5
 
-    side = "LONG" if long_score >= short_score else "SHORT"
-    score = max(long_score, short_score)
+    if long_score >= short_score:
+        direction = "LONG"
+        score = long_score
+    else:
+        direction = "SHORT"
+        score = short_score
 
     if score < 55:
         return None
 
-    entry = float(last["Close"])
-    if side == "LONG":
-        sl = entry - 1.2 * float(last["ATR"])
-        target = entry + 2.0 * float(last["ATR"])
-        reasons = long_reasons
+    entry = float(latest["Close"])
+    atr = float(latest["ATR14"])
+
+    if direction == "LONG":
+        sl = entry - (1.2 * atr)
+        target = entry + (2.0 * atr)
     else:
-        sl = entry + 1.2 * float(last["ATR"])
-        target = entry - 2.0 * float(last["ATR"])
-        reasons = short_reasons
+        sl = entry + (1.2 * atr)
+        target = entry - (2.0 * atr)
 
     return {
-        "Symbol": str(last["Symbol"]),
-        "Signal": side,
-        "Score": int(score),
-        "Close": round(entry, 2),
-        "ATR": round(float(last["ATR"]), 2),
+        "Symbol": symbol,
+        "Direction": direction,
+        "Score": round(score, 1),
         "Entry": round(entry, 2),
-        "Stop Loss": round(sl, 2),
+        "SL": round(sl, 2),
         "Target": round(target, 2),
-        "RVOL": round(float(last["RVOL"]), 2),
-        "RSI": round(float(last["RSI"]), 1),
-        "VWAP": round(float(last["VWAP"]), 2),
-        "Reasons": " • ".join(reasons),
+        "ATR14": round(atr, 2),
+        "RSI14": round(float(latest["RSI14"]), 1),
+        "RVOL": round(float(latest["RVOL"]), 2),
+        "VWAP": round(float(latest["VWAP"]), 2),
+        "Last Candle": latest["Datetime"]
     }
 
-if uploaded:
-    try:
-        df = pd.read_csv(uploaded)
-        df.columns = [c.strip() for c in df.columns]
-        required = {"Datetime","Symbol","Open","High","Low","Close","Volume"}
-        missing = required - set(df.columns)
-        if missing:
-            st.error("Missing columns: " + ", ".join(sorted(missing)))
-            st.stop()
 
-        df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce")
-        for c in ["Open","High","Low","Close","Volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.dropna(subset=["Datetime","Symbol","Open","High","Low","Close","Volume"])
+# =========================================================
+# UI
+# =========================================================
 
-        results = []
-        for symbol, group in df.groupby("Symbol"):
-            r = scan_symbol(group)
-            if r:
-                results.append(r)
+st.subheader("⚡ Live NSE Scanner")
 
-        if not results:
-            st.warning("No setups passed the V1 filters.")
-        else:
-            out = pd.DataFrame(results).sort_values("Score", ascending=False)
-            st.subheader("🔥 Top Intraday Setups")
-            st.dataframe(out, use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download scan results",
-                out.to_csv(index=False).encode("utf-8"),
-                "intraday_scan_results.csv",
-                "text/csv"
+interval = st.selectbox(
+    "Candle interval",
+    [1, 3, 5, 10, 15],
+    index=2
+)
+
+selected_stocks = st.multiselect(
+    "Stocks to scan",
+    list(STOCKS.keys()),
+    default=list(STOCKS.keys())
+)
+
+scan_button = st.button(
+    "🔎 Scan Market",
+    type="primary"
+)
+
+if not UPSTOX_TOKEN:
+    st.error(
+        "Upstox Analytics Token नहीं मिला। "
+        "Streamlit Secrets में UPSTOX_ANALYTICS_TOKEN check करें."
+    )
+    st.stop()
+
+if scan_button:
+
+    if not selected_stocks:
+        st.warning(
+            "कम से कम एक stock select करो."
+        )
+        st.stop()
+
+    results = []
+    progress = st.progress(0)
+
+    for i, symbol in enumerate(selected_stocks):
+
+        try:
+            data = get_intraday_data(
+                STOCKS[symbol],
+                interval=interval
             )
-    except Exception as e:
-        st.error(f"Could not process file: {e}")
-else:
-    st.markdown("""
-### V1 scanner
-- EMA 20 / 50 / 200
-- Intraday VWAP
-- 20-bar breakout / breakdown
-- Relative Volume
-- RSI 14
-- ATR 14
-- Setup score
-- LONG / SHORT ranking
-- Indicative ATR-based SL and target
 
-This is a research scanner, not a guarantee of profitable trades.
-""")
+            if data.empty:
+                continue
+
+            if len(data) < 220:
+                continue
+
+            data = add_indicators(data)
+
+            latest = data.iloc[-1]
+
+            long_score = 5
+            short_score = 5
+
+            if (
+                latest["EMA20"] >
+                latest["EMA50"] >
+                latest["EMA200"]
+            ):
+                long_score += 20
+
+            if (
+                latest["EMA20"] <
+                latest["EMA50"] <
+                latest["EMA200"]
+            ):
+                short_score += 20
+
+            if latest["Close"] > latest["VWAP"]:
+                long_score += 15
+
+            if latest["Close"] < latest["VWAP"]:
+                short_score += 15
+
+            if latest["Breakout"]:
+                long_score += 25
+
+            if latest["Breakdown"]:
+                short_score += 25
+
+            if latest["RVOL"] >= 1.5:
+                long_score += 15
+                short_score += 15
+
+            if 55 <= latest["RSI14"] <= 75:
+                long_score += 10
+
+            if 25 <= latest["RSI14"] <= 45:
+                short_score += 10
+
+            if max(
+                long_score,
+                short_score
+            ) < 55:
+                continue
+
+            if long_score >= short_score:
+                direction = "LONG"
+                score = long_score
+                entry = float(latest["Close"])
+                sl = entry - 1.2 * float(latest["ATR14"])
+                target = entry + 2.0 * float(latest["ATR14"])
+            else:
+                direction = "SHORT"
+                score = short_score
+                entry = float(latest["Close"])
+                sl = entry + 1.2 * float(latest["ATR14"])
+                target = entry - 2.0 * float(latest["ATR14"])
+
+            results.append({
+                "Symbol": symbol,
+                "Direction": direction,
+                "Score": round(score, 1),
+                "Entry": round(entry, 2),
+                "SL": round(sl, 2),
+                "Target": round(target, 2),
+                "ATR14": round(float(latest["ATR14"]), 2),
+                "RSI14": round(float(latest["RSI14"]), 1),
+                "RVOL": round(float(latest["RVOL"]), 2),
+                "VWAP": round(float(latest["VWAP"]), 2),
+                "Last Candle": latest["Datetime"]
+            })
+
+        except Exception as e:
+            st.warning(
+                f"{symbol}: {str(e)}"
+            )
+
+        progress.progress(
+            (i + 1) / len(selected_stocks)
+        )
+
+    if results:
+
+        result_df = pd.DataFrame(
+            results
+        ).sort_values(
+            "Score",
+            ascending=False
+        )
+
+        st.success(
+            f"{len(result_df)} setup(s) मिले."
+        )
+
+        st.dataframe(
+            result_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        csv = result_df.to_csv(
+            index=False
+        ).encode("utf-8")
+
+        st.download_button(
+            "⬇️ Download Scanner Results",
+            csv,
+            "intraday_edge_live_scan.csv",
+            "text/csv"
+        )
+
+    else:
+        st.info(
+            "अभी कोई 55+ setup नहीं मिला। "
+            "यह जरूरी नहीं कि market में कोई trade नहीं है; "
+            "हमारा current filter strict है."
+        )
+
+else:
+    st.info(
+        "Stocks select करके **Scan Market** दबाओ."
+    )
+
+st.divider()
+
+st.caption(
+    "Research / scanning only • No automatic order placement"
+)
+
+st.caption(
+    "Signals are rule-based research outputs, "
+    "not a guarantee of profitable trades."
+)

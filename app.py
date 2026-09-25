@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="Intraday Edge Scanner", page_icon="🎯", layout="wide")
 
-st.title("🎯 Intraday Edge Scanner — V3")
+st.title("🎯 Intraday Edge Scanner — V5")
 st.caption("Live NSE research scanner + rule-based backtest • No automatic order placement")
 
 UPSTOX_TOKEN = st.secrets.get("UPSTOX_ANALYTICS_TOKEN", "")
@@ -228,19 +228,24 @@ def backtest_symbol(df, symbol, min_score=55, max_hold_bars=24):
     work = add_indicators(df)
     trades = []
 
-    # Signal is generated at candle close; execution begins from the NEXT candle.
-    for i in range(220, len(work) - 1):
+    # V5: one active position per stock at a time.
+    # A new signal is not evaluated until the previous trade has exited.
+    i = 220
+    while i < len(work) - 1:
         row = work.iloc[i]
         signal = score_row(row)
-        if signal is None:
+        if signal is None or signal["Score"] < min_score:
+            i += 1
             continue
 
         entry_idx = i + 1
         entry_row = work.iloc[entry_idx]
         entry = float(entry_row["Open"])
-
-        # Keep the original ATR-based distance from the signal candle.
         atr = float(row["ATR14"])
+        if not np.isfinite(atr) or atr <= 0:
+            i += 1
+            continue
+
         if signal["Direction"] == "LONG":
             sl = entry - 1.2 * atr
             target = entry + 2.0 * atr
@@ -251,17 +256,14 @@ def backtest_symbol(df, symbol, min_score=55, max_hold_bars=24):
         exit_price = None
         exit_time = None
         outcome = "TIME_EXIT"
+        exit_idx = min(len(work) - 1, entry_idx + max_hold_bars)
 
-        last_idx = min(len(work) - 1, entry_idx + max_hold_bars)
-
-        for j in range(entry_idx, last_idx + 1):
+        for j in range(entry_idx, exit_idx + 1):
             bar = work.iloc[j]
-
             if signal["Direction"] == "LONG":
                 hit_sl = bar["Low"] <= sl
                 hit_target = bar["High"] >= target
                 if hit_sl and hit_target:
-                    # Conservative same-candle assumption.
                     exit_price = sl
                     outcome = "SL"
                 elif hit_sl:
@@ -288,8 +290,8 @@ def backtest_symbol(df, symbol, min_score=55, max_hold_bars=24):
                 break
 
         if exit_price is None:
-            exit_price = float(work.iloc[last_idx]["Close"])
-            exit_time = work.iloc[last_idx]["Datetime"]
+            exit_price = float(work.iloc[exit_idx]["Close"])
+            exit_time = work.iloc[exit_idx]["Datetime"]
 
         if signal["Direction"] == "LONG":
             pnl_r = (exit_price - entry) / (1.2 * atr)
@@ -310,6 +312,9 @@ def backtest_symbol(df, symbol, min_score=55, max_hold_bars=24):
             "Outcome": outcome,
             "R": round(pnl_r, 3),
         })
+
+        # Critical V5 fix: skip every candle while this trade is active.
+        i = exit_idx + 1
 
     return trades
 
@@ -404,7 +409,7 @@ with tab_backtest:
     st.subheader("Rule-Based Backtest")
     st.caption(
         "Signal candle के close पर setup बनता है और entry अगले candle के open से शुरू होती है. "
-        "Same-candle SL + target hit होने पर conservative assumption में SL माना जाता है."
+        "Same-candle SL + target hit होने पर conservative assumption में SL माना जाता है. V5 में एक stock पर एक समय में केवल एक active trade होगा."
     )
 
     bt_interval = st.selectbox(
@@ -486,7 +491,7 @@ with tab_backtest:
 
 with tab_diagnosis:
     st.subheader("🧪 Strategy Diagnosis")
-    st.caption("LONG/SHORT और score ranges को अलग-अलग measure करता है। Historical simulation है, guarantee नहीं।")
+    st.caption("LONG/SHORT और score ranges को अलग-अलग measure करता है। V5 में overlapping trades नहीं होंगे; एक stock पर एक समय में केवल एक active trade होगा। Historical simulation है, guarantee नहीं।")
     dg_interval=st.selectbox("Diagnosis candle interval",[5,10,15],index=0,key="dg_interval")
     dg_stocks=st.multiselect("Diagnosis stocks",list(STOCKS.keys()),default=list(STOCKS.keys()),key="dg_stocks")
     dg_max_hold=st.slider("Diagnosis maximum holding candles",6,48,24,3,key="dg_max_hold")

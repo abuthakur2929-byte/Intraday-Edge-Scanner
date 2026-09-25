@@ -344,7 +344,7 @@ if not UPSTOX_TOKEN:
 
 st.info(f"Scanner clock: {now_ist().strftime('%d-%m-%Y %H:%M:%S IST')}")
 
-tab_live, tab_backtest = st.tabs(["⚡ Live Scan", "📊 Backtest"])
+tab_live, tab_backtest, tab_diagnosis = st.tabs(["⚡ Live Scan", "📊 Backtest", "🧪 Strategy Diagnosis"])
 
 with tab_live:
     st.subheader("Live NSE Scanner")
@@ -482,6 +482,51 @@ with tab_backtest:
                 with st.expander("Backtest API / data errors"):
                     for err in errors:
                         st.write(err)
+
+
+with tab_diagnosis:
+    st.subheader("🧪 Strategy Diagnosis")
+    st.caption("LONG/SHORT और score ranges को अलग-अलग measure करता है। Historical simulation है, guarantee नहीं।")
+    dg_interval=st.selectbox("Diagnosis candle interval",[5,10,15],index=0,key="dg_interval")
+    dg_stocks=st.multiselect("Diagnosis stocks",list(STOCKS.keys()),default=list(STOCKS.keys()),key="dg_stocks")
+    dg_max_hold=st.slider("Diagnosis maximum holding candles",6,48,24,3,key="dg_max_hold")
+    if st.button("🧪 Run Strategy Diagnosis",type="primary",key="diagnosis"):
+        if not dg_stocks: st.warning("कम से कम एक stock select करो.")
+        else:
+            dg_trades=[]; dg_errors=[]; progress=st.progress(0); status=st.empty()
+            for i,symbol in enumerate(dg_stocks):
+                status.write(f"Diagnosing {symbol}...")
+                try:
+                    data=get_historical_data(STOCKS[symbol],interval=dg_interval,days_back=30)
+                    if not data.empty: dg_trades.extend(backtest_symbol(data,symbol,min_score=55,max_hold_bars=dg_max_hold))
+                except Exception as e: dg_errors.append(f"{symbol}: {e}")
+                progress.progress((i+1)/len(dg_stocks))
+            status.empty()
+            if dg_trades:
+                dt=pd.DataFrame(dg_trades)
+                def stats(sub):
+                    wins=int((sub.R>0).sum()); gp=sub.loc[sub.R>0,'R'].sum(); gl=abs(sub.loc[sub.R<0,'R'].sum())
+                    return len(sub),round(100*wins/len(sub),2),round(sub.R.sum(),3),round(gp/gl,3) if gl else float('inf'),round(sub.R.mean(),4)
+                rows=[]
+                for d in ['LONG','SHORT']:
+                    s=dt[dt.Direction==d]
+                    if len(s):
+                        n,w,nr,pf,av=stats(s); rows.append({'Direction':d,'Trades':n,'Win Rate %':w,'Net R':nr,'Profit Factor':pf,'Avg R':av})
+                st.markdown('### LONG vs SHORT'); st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+                dt['Score Band']=pd.cut(dt.Score,bins=[54,59,64,69,74,79,84,89,100],labels=['55–59','60–64','65–69','70–74','75–79','80–84','85–89','90+'],include_lowest=True)
+                rows=[]
+                for band,s in dt.groupby('Score Band',observed=False):
+                    if len(s):
+                        n,w,nr,pf,av=stats(s); rows.append({'Score Band':str(band),'Trades':n,'Win Rate %':w,'Net R':nr,'Profit Factor':pf,'Avg R':av})
+                st.markdown('### Score-band diagnosis'); st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+                outcome=dt.groupby('Outcome').agg(Trades=('R','size'),Net_R=('R','sum'),Avg_R=('R','mean')).reset_index(); outcome[['Net_R','Avg_R']]=outcome[['Net_R','Avg_R']].round(4)
+                st.markdown('### Exit diagnosis'); st.dataframe(outcome,use_container_width=True,hide_index=True)
+                st.download_button('⬇️ Download Diagnosis Trades',dt.to_csv(index=False).encode(), 'intraday_edge_strategy_diagnosis.csv','text/csv')
+            else: st.warning('इस period में कोई qualifying setup नहीं मिला.')
+            if dg_errors:
+                with st.expander('Diagnosis API / data errors'):
+                    for err in dg_errors: st.write(err)
+
 
 st.divider()
 st.caption("Research / scanning only • No automatic order placement")

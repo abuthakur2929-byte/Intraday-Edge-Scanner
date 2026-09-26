@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="Intraday Edge Scanner", page_icon="🎯", layout="wide")
 
-st.title("🎯 Intraday Edge Scanner — V5")
+st.title("🎯 Intraday Edge Scanner — V6")
 st.caption("Live NSE research scanner + rule-based backtest • No automatic order placement")
 
 UPSTOX_TOKEN = st.secrets.get("UPSTOX_ANALYTICS_TOKEN", "")
@@ -212,6 +212,145 @@ def score_row(row):
         "Datetime": row["Datetime"],
     }
 
+
+def score_direction(row, direction):
+    required = ["EMA20", "EMA50", "EMA200", "VWAP", "RSI14", "ATR14", "RVOL"]
+    if any(pd.isna(row[c]) for c in required):
+        return None
+
+    score = 5
+
+    if direction == "LONG":
+        if row["EMA20"] > row["EMA50"] > row["EMA200"]:
+            score += 20
+        if row["Close"] > row["VWAP"]:
+            score += 15
+        if bool(row["Breakout"]):
+            score += 25
+        if row["RVOL"] >= 1.5:
+            score += 15
+        if 55 <= row["RSI14"] <= 75:
+            score += 10
+    else:
+        if row["EMA20"] < row["EMA50"] < row["EMA200"]:
+            score += 20
+        if row["Close"] < row["VWAP"]:
+            score += 15
+        if bool(row["Breakdown"]):
+            score += 25
+        if row["RVOL"] >= 1.5:
+            score += 15
+        if 25 <= row["RSI14"] <= 45:
+            score += 10
+
+    return score
+
+
+def v6_backtest_symbol(df, symbol, direction, min_score=55, max_hold_bars=24,
+                       use_regime=True):
+    """V6: independent LONG/SHORT testing, one active trade per stock,
+    and a simple higher-timeframe trend regime using EMA50/EMA200."""
+    if df.empty:
+        return []
+
+    work = add_indicators(df)
+    trades = []
+    i = 220
+
+    while i < len(work) - 1:
+        row = work.iloc[i]
+        score = score_direction(row, direction)
+
+        if score is None or score < min_score:
+            i += 1
+            continue
+
+        # V6 regime filter: only trade in the stock's prevailing trend.
+        # This is deliberately based only on information available at signal close.
+        if use_regime:
+            if direction == "LONG" and not (row["EMA50"] > row["EMA200"]):
+                i += 1
+                continue
+            if direction == "SHORT" and not (row["EMA50"] < row["EMA200"]):
+                i += 1
+                continue
+
+        entry_idx = i + 1
+        entry_row = work.iloc[entry_idx]
+        entry = float(entry_row["Open"])
+        atr = float(row["ATR14"])
+
+        if not np.isfinite(atr) or atr <= 0:
+            i += 1
+            continue
+
+        if direction == "LONG":
+            sl = entry - 1.2 * atr
+            target = entry + 2.0 * atr
+        else:
+            sl = entry + 1.2 * atr
+            target = entry - 2.0 * atr
+
+        exit_price = None
+        exit_time = None
+        outcome = "TIME_EXIT"
+        exit_idx = min(len(work) - 1, entry_idx + max_hold_bars)
+
+        for j in range(entry_idx, exit_idx + 1):
+            bar = work.iloc[j]
+
+            if direction == "LONG":
+                hit_sl = bar["Low"] <= sl
+                hit_target = bar["High"] >= target
+            else:
+                hit_sl = bar["High"] >= sl
+                hit_target = bar["Low"] <= target
+
+            # Conservative same-candle rule: SL wins if both are touched.
+            if hit_sl and hit_target:
+                exit_price = sl
+                outcome = "SL"
+            elif hit_sl:
+                exit_price = sl
+                outcome = "SL"
+            elif hit_target:
+                exit_price = target
+                outcome = "TARGET"
+
+            if exit_price is not None:
+                exit_time = bar["Datetime"]
+                break
+
+        if exit_price is None:
+            exit_price = float(work.iloc[exit_idx]["Close"])
+            exit_time = work.iloc[exit_idx]["Datetime"]
+
+        if direction == "LONG":
+            pnl_r = (exit_price - entry) / (1.2 * atr)
+        else:
+            pnl_r = (entry - exit_price) / (1.2 * atr)
+
+        trades.append({
+            "Symbol": symbol,
+            "Direction": direction,
+            "Score": round(score, 1),
+            "Signal Time": row["Datetime"],
+            "Entry Time": entry_row["Datetime"],
+            "Entry": round(entry, 2),
+            "SL": round(sl, 2),
+            "Target": round(target, 2),
+            "Exit": round(exit_price, 2),
+            "Exit Time": exit_time,
+            "Outcome": outcome,
+            "R": round(pnl_r, 3),
+        })
+
+        # No overlapping positions.
+        i = exit_idx + 1
+
+    return trades
+
+
 def live_signal(df, symbol):
     if df.empty:
         return None
@@ -228,7 +367,7 @@ def backtest_symbol(df, symbol, min_score=55, max_hold_bars=24):
     work = add_indicators(df)
     trades = []
 
-    # V5: one active position per stock at a time.
+    # V6: one active position per stock at a time.
     # A new signal is not evaluated until the previous trade has exited.
     i = 220
     while i < len(work) - 1:
@@ -313,7 +452,7 @@ def backtest_symbol(df, symbol, min_score=55, max_hold_bars=24):
             "R": round(pnl_r, 3),
         })
 
-        # Critical V5 fix: skip every candle while this trade is active.
+        # Critical V6 fix: skip every candle while this trade is active.
         i = exit_idx + 1
 
     return trades
@@ -409,7 +548,7 @@ with tab_backtest:
     st.subheader("Rule-Based Backtest")
     st.caption(
         "Signal candle के close पर setup बनता है और entry अगले candle के open से शुरू होती है. "
-        "Same-candle SL + target hit होने पर conservative assumption में SL माना जाता है. V5 में एक stock पर एक समय में केवल एक active trade होगा."
+        "Same-candle SL + target hit होने पर conservative assumption में SL माना जाता है. V6 में एक stock पर एक समय में केवल एक active trade होगा."
     )
 
     bt_interval = st.selectbox(
@@ -490,48 +629,172 @@ with tab_backtest:
 
 
 with tab_diagnosis:
-    st.subheader("🧪 Strategy Diagnosis")
-    st.caption("LONG/SHORT और score ranges को अलग-अलग measure करता है। V5 में overlapping trades नहीं होंगे; एक stock पर एक समय में केवल एक active trade होगा। Historical simulation है, guarantee नहीं।")
-    dg_interval=st.selectbox("Diagnosis candle interval",[5,10,15],index=0,key="dg_interval")
-    dg_stocks=st.multiselect("Diagnosis stocks",list(STOCKS.keys()),default=list(STOCKS.keys()),key="dg_stocks")
-    dg_max_hold=st.slider("Diagnosis maximum holding candles",6,48,24,3,key="dg_max_hold")
-    if st.button("🧪 Run Strategy Diagnosis",type="primary",key="diagnosis"):
-        if not dg_stocks: st.warning("कम से कम एक stock select करो.")
+    st.subheader("🧪 Strategy Diagnosis — V6")
+    st.caption(
+        "LONG और SHORT को अलग-अलग test करता है। V6 में overlapping trades नहीं होंगे "
+        "और EMA50/EMA200 trend-regime filter का प्रभाव अलग से measure किया जाएगा."
+    )
+
+    dg_interval = st.selectbox(
+        "Diagnosis candle interval", [5, 10, 15], index=0, key="dg_interval"
+    )
+    dg_stocks = st.multiselect(
+        "Diagnosis stocks",
+        list(STOCKS.keys()),
+        default=list(STOCKS.keys()),
+        key="dg_stocks",
+    )
+    dg_max_hold = st.slider(
+        "Diagnosis maximum holding candles", 6, 48, 24, 3, key="dg_max_hold"
+    )
+    use_regime = st.checkbox(
+        "Use EMA50/EMA200 trend-regime filter",
+        value=True,
+        key="dg_regime",
+    )
+
+    if st.button("🧪 Run V6 Strategy Diagnosis", type="primary", key="diagnosis"):
+        if not dg_stocks:
+            st.warning("कम से कम एक stock select करो.")
         else:
-            dg_trades=[]; dg_errors=[]; progress=st.progress(0); status=st.empty()
-            for i,symbol in enumerate(dg_stocks):
+            dg_trades = []
+            dg_errors = []
+            progress = st.progress(0)
+            status = st.empty()
+
+            total_jobs = len(dg_stocks) * 2
+            job = 0
+
+            for symbol in dg_stocks:
                 status.write(f"Diagnosing {symbol}...")
                 try:
-                    data=get_historical_data(STOCKS[symbol],interval=dg_interval,days_back=30)
-                    if not data.empty: dg_trades.extend(backtest_symbol(data,symbol,min_score=55,max_hold_bars=dg_max_hold))
-                except Exception as e: dg_errors.append(f"{symbol}: {e}")
-                progress.progress((i+1)/len(dg_stocks))
-            status.empty()
-            if dg_trades:
-                dt=pd.DataFrame(dg_trades)
-                def stats(sub):
-                    wins=int((sub.R>0).sum()); gp=sub.loc[sub.R>0,'R'].sum(); gl=abs(sub.loc[sub.R<0,'R'].sum())
-                    return len(sub),round(100*wins/len(sub),2),round(sub.R.sum(),3),round(gp/gl,3) if gl else float('inf'),round(sub.R.mean(),4)
-                rows=[]
-                for d in ['LONG','SHORT']:
-                    s=dt[dt.Direction==d]
-                    if len(s):
-                        n,w,nr,pf,av=stats(s); rows.append({'Direction':d,'Trades':n,'Win Rate %':w,'Net R':nr,'Profit Factor':pf,'Avg R':av})
-                st.markdown('### LONG vs SHORT'); st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
-                dt['Score Band']=pd.cut(dt.Score,bins=[54,59,64,69,74,79,84,89,100],labels=['55–59','60–64','65–69','70–74','75–79','80–84','85–89','90+'],include_lowest=True)
-                rows=[]
-                for band,s in dt.groupby('Score Band',observed=False):
-                    if len(s):
-                        n,w,nr,pf,av=stats(s); rows.append({'Score Band':str(band),'Trades':n,'Win Rate %':w,'Net R':nr,'Profit Factor':pf,'Avg R':av})
-                st.markdown('### Score-band diagnosis'); st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
-                outcome=dt.groupby('Outcome').agg(Trades=('R','size'),Net_R=('R','sum'),Avg_R=('R','mean')).reset_index(); outcome[['Net_R','Avg_R']]=outcome[['Net_R','Avg_R']].round(4)
-                st.markdown('### Exit diagnosis'); st.dataframe(outcome,use_container_width=True,hide_index=True)
-                st.download_button('⬇️ Download Diagnosis Trades',dt.to_csv(index=False).encode(), 'intraday_edge_strategy_diagnosis.csv','text/csv')
-            else: st.warning('इस period में कोई qualifying setup नहीं मिला.')
-            if dg_errors:
-                with st.expander('Diagnosis API / data errors'):
-                    for err in dg_errors: st.write(err)
+                    data = get_historical_data(
+                        STOCKS[symbol],
+                        interval=dg_interval,
+                        days_back=30,
+                    )
+                    if not data.empty:
+                        for direction in ["LONG", "SHORT"]:
+                            dg_trades.extend(
+                                v6_backtest_symbol(
+                                    data,
+                                    symbol,
+                                    direction=direction,
+                                    min_score=55,
+                                    max_hold_bars=dg_max_hold,
+                                    use_regime=use_regime,
+                                )
+                            )
+                except Exception as e:
+                    dg_errors.append(f"{symbol}: {e}")
 
+                job += 2
+                progress.progress(job / total_jobs)
+
+            status.empty()
+
+            if dg_trades:
+                dt = pd.DataFrame(dg_trades)
+
+                def stats(sub):
+                    wins = int((sub.R > 0).sum())
+                    gp = sub.loc[sub.R > 0, "R"].sum()
+                    gl = abs(sub.loc[sub.R < 0, "R"].sum())
+                    return (
+                        len(sub),
+                        round(100 * wins / len(sub), 2),
+                        round(sub.R.sum(), 3),
+                        round(gp / gl, 3) if gl else float("inf"),
+                        round(sub.R.mean(), 4),
+                    )
+
+                rows = []
+                for d in ["LONG", "SHORT"]:
+                    s = dt[dt.Direction == d]
+                    if len(s):
+                        n, w, nr, pf, av = stats(s)
+                        rows.append({
+                            "Direction": d,
+                            "Trades": n,
+                            "Win Rate %": w,
+                            "Net R": nr,
+                            "Profit Factor": pf,
+                            "Avg R": av,
+                        })
+
+                st.markdown("### V6 LONG vs SHORT")
+                st.dataframe(
+                    pd.DataFrame(rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                dt["Score Band"] = pd.cut(
+                    dt.Score,
+                    bins=[54, 59, 64, 69, 74, 79, 84, 89, 100],
+                    labels=[
+                        "55–59", "60–64", "65–69", "70–74",
+                        "75–79", "80–84", "85–89", "90+"
+                    ],
+                    include_lowest=True,
+                )
+
+                rows = []
+                for (direction, band), s in dt.groupby(
+                    ["Direction", "Score Band"], observed=False
+                ):
+                    if len(s):
+                        n, w, nr, pf, av = stats(s)
+                        rows.append({
+                            "Direction": direction,
+                            "Score Band": str(band),
+                            "Trades": n,
+                            "Win Rate %": w,
+                            "Net R": nr,
+                            "Profit Factor": pf,
+                            "Avg R": av,
+                        })
+
+                st.markdown("### V6 Direction + Score-band diagnosis")
+                st.dataframe(
+                    pd.DataFrame(rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                outcome = (
+                    dt.groupby(["Direction", "Outcome"])
+                    .agg(
+                        Trades=("R", "size"),
+                        Net_R=("R", "sum"),
+                        Avg_R=("R", "mean"),
+                    )
+                    .reset_index()
+                )
+                outcome[["Net_R", "Avg_R"]] = outcome[
+                    ["Net_R", "Avg_R"]
+                ].round(4)
+
+                st.markdown("### V6 Exit diagnosis")
+                st.dataframe(
+                    outcome,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                st.download_button(
+                    "⬇️ Download V6 Diagnosis Trades",
+                    dt.to_csv(index=False).encode(),
+                    "intraday_edge_strategy_diagnosis_v6.csv",
+                    "text/csv",
+                )
+            else:
+                st.warning("इस period में कोई qualifying setup नहीं मिला.")
+
+            if dg_errors:
+                with st.expander("Diagnosis API / data errors"):
+                    for err in dg_errors:
+                        st.write(err)
 
 st.divider()
 st.caption("Research / scanning only • No automatic order placement")

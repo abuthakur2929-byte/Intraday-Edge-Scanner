@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="Intraday Edge Scanner", page_icon="🎯", layout="wide")
 
-st.title("🎯 Intraday Edge Scanner — V6")
+st.title("🎯 Intraday Edge Scanner — V7")
 st.caption("Live NSE research scanner + rule-based backtest • No automatic order placement")
 
 UPSTOX_TOKEN = st.secrets.get("UPSTOX_ANALYTICS_TOKEN", "")
@@ -548,7 +548,7 @@ with tab_backtest:
     st.subheader("Rule-Based Backtest")
     st.caption(
         "Signal candle के close पर setup बनता है और entry अगले candle के open से शुरू होती है. "
-        "Same-candle SL + target hit होने पर conservative assumption में SL माना जाता है. V6 में एक stock पर एक समय में केवल एक active trade होगा."
+        "Same-candle SL + target hit होने पर conservative assumption में SL माना जाता है. V7 में एक stock पर एक समय में केवल एक active trade होगा."
     )
 
     bt_interval = st.selectbox(
@@ -628,172 +628,287 @@ with tab_backtest:
                         st.write(err)
 
 
+def v7_backtest_symbol(df, symbol, direction, score_min, score_max,
+                       max_hold_bars=24, use_regime=False):
+    """V7 validation: test one direction and one score band only.
+    No overlapping trades. Optional regime filter is disabled by default
+    so the score-band effect is isolated from V6.
+    """
+    if df.empty:
+        return []
+
+    work = add_indicators(df)
+    trades = []
+    i = 220
+
+    while i < len(work) - 1:
+        row = work.iloc[i]
+        score = score_direction(row, direction)
+
+        if score is None or score < score_min or score > score_max:
+            i += 1
+            continue
+
+        if use_regime:
+            if direction == "LONG" and not (row["EMA50"] > row["EMA200"]):
+                i += 1
+                continue
+            if direction == "SHORT" and not (row["EMA50"] < row["EMA200"]):
+                i += 1
+                continue
+
+        entry_idx = i + 1
+        entry_row = work.iloc[entry_idx]
+        entry = float(entry_row["Open"])
+        atr = float(row["ATR14"])
+
+        if not np.isfinite(atr) or atr <= 0:
+            i += 1
+            continue
+
+        sl = entry - 1.2 * atr if direction == "LONG" else entry + 1.2 * atr
+        target = entry + 2.0 * atr if direction == "LONG" else entry - 2.0 * atr
+
+        exit_idx = min(len(work) - 1, entry_idx + max_hold_bars)
+        exit_price = None
+        exit_time = None
+        outcome = "TIME_EXIT"
+
+        for j in range(entry_idx, exit_idx + 1):
+            bar = work.iloc[j]
+
+            if direction == "LONG":
+                hit_sl = bar["Low"] <= sl
+                hit_target = bar["High"] >= target
+            else:
+                hit_sl = bar["High"] >= sl
+                hit_target = bar["Low"] <= target
+
+            if hit_sl and hit_target:
+                exit_price = sl
+                outcome = "SL"
+            elif hit_sl:
+                exit_price = sl
+                outcome = "SL"
+            elif hit_target:
+                exit_price = target
+                outcome = "TARGET"
+
+            if exit_price is not None:
+                exit_time = bar["Datetime"]
+                break
+
+        if exit_price is None:
+            exit_price = float(work.iloc[exit_idx]["Close"])
+            exit_time = work.iloc[exit_idx]["Datetime"]
+
+        pnl_r = (
+            (exit_price - entry) / (1.2 * atr)
+            if direction == "LONG"
+            else (entry - exit_price) / (1.2 * atr)
+        )
+
+        trades.append({
+            "Symbol": symbol,
+            "Direction": direction,
+            "Score": round(score, 1),
+            "Signal Time": row["Datetime"],
+            "Entry Time": entry_row["Datetime"],
+            "Entry": round(entry, 2),
+            "SL": round(sl, 2),
+            "Target": round(target, 2),
+            "Exit": round(exit_price, 2),
+            "Exit Time": exit_time,
+            "Outcome": outcome,
+            "R": round(pnl_r, 3),
+        })
+
+        i = exit_idx + 1
+
+    return trades
+
+
+def v7_stats(df):
+    if df.empty:
+        return {
+            "Trades": 0, "Win Rate %": 0.0,
+            "Net R": 0.0, "Profit Factor": 0.0, "Avg R": 0.0
+        }
+    wins = int((df["R"] > 0).sum())
+    gp = df.loc[df["R"] > 0, "R"].sum()
+    gl = abs(df.loc[df["R"] < 0, "R"].sum())
+    return {
+        "Trades": len(df),
+        "Win Rate %": round(100 * wins / len(df), 2),
+        "Net R": round(df["R"].sum(), 3),
+        "Profit Factor": round(gp / gl, 3) if gl else float("inf"),
+        "Avg R": round(df["R"].mean(), 4),
+    }
+
+
+def v7_walkforward_split(df, train_days=15):
+    """Chronological split: first 15 calendar days train, remaining test."""
+    if df.empty:
+        return df, df
+    d = pd.to_datetime(df["Signal Time"])
+    cutoff = d.min() + pd.Timedelta(days=train_days)
+    return df[d < cutoff].copy(), df[d >= cutoff].copy()
+
+
 with tab_diagnosis:
-    st.subheader("🧪 Strategy Diagnosis — V6")
+    st.subheader("🧪 Strategy Validation — V7")
     st.caption(
-        "LONG और SHORT को अलग-अलग test करता है। V6 में overlapping trades नहीं होंगे "
-        "और EMA50/EMA200 trend-regime filter का प्रभाव अलग से measure किया जाएगा."
+        "V7 ka purpose promising score bands ko isolate karke validate karna hai. "
+        "Default mein regime filter OFF hai, taaki score-band effect alag measure ho."
     )
 
-    dg_interval = st.selectbox(
-        "Diagnosis candle interval", [5, 10, 15], index=0, key="dg_interval"
+    v7_interval = st.selectbox(
+        "Validation candle interval", [5, 10, 15], index=0, key="v7_interval"
     )
-    dg_stocks = st.multiselect(
-        "Diagnosis stocks",
+    v7_stocks = st.multiselect(
+        "Validation stocks",
         list(STOCKS.keys()),
         default=list(STOCKS.keys()),
-        key="dg_stocks",
+        key="v7_stocks",
     )
-    dg_max_hold = st.slider(
-        "Diagnosis maximum holding candles", 6, 48, 24, 3, key="dg_max_hold"
+    v7_hold = st.slider(
+        "Maximum holding candles", 6, 48, 24, 3, key="v7_hold"
     )
-    use_regime = st.checkbox(
-        "Use EMA50/EMA200 trend-regime filter",
-        value=True,
-        key="dg_regime",
+    v7_regime = st.checkbox(
+        "Apply EMA50/EMA200 regime filter",
+        value=False,
+        key="v7_regime",
     )
 
-    if st.button("🧪 Run V6 Strategy Diagnosis", type="primary", key="diagnosis"):
-        if not dg_stocks:
+    st.markdown("**Focused tests:** SHORT 65–69, LONG 90+, plus broader comparison bands.")
+    if st.button("🧪 Run V7 Validation", type="primary", key="v7_run"):
+        if not v7_stocks:
             st.warning("कम से कम एक stock select करो.")
         else:
-            dg_trades = []
-            dg_errors = []
+            tests = [
+                ("SHORT", 65, 69),
+                ("LONG", 90, 100),
+                ("SHORT", 70, 100),
+                ("LONG", 75, 100),
+                ("SHORT", 55, 64),
+                ("LONG", 55, 74),
+            ]
+
+            all_rows = []
+            errors = []
             progress = st.progress(0)
             status = st.empty()
 
-            total_jobs = len(dg_stocks) * 2
-            job = 0
+            total = len(v7_stocks) * len(tests)
+            done = 0
 
-            for symbol in dg_stocks:
-                status.write(f"Diagnosing {symbol}...")
+            for symbol in v7_stocks:
+                status.write(f"Validating {symbol}...")
                 try:
                     data = get_historical_data(
                         STOCKS[symbol],
-                        interval=dg_interval,
+                        interval=v7_interval,
                         days_back=30,
                     )
                     if not data.empty:
-                        for direction in ["LONG", "SHORT"]:
-                            dg_trades.extend(
-                                v6_backtest_symbol(
-                                    data,
-                                    symbol,
-                                    direction=direction,
-                                    min_score=55,
-                                    max_hold_bars=dg_max_hold,
-                                    use_regime=use_regime,
-                                )
+                        for direction, lo, hi in tests:
+                            trades = v7_backtest_symbol(
+                                data, symbol, direction, lo, hi,
+                                max_hold_bars=v7_hold,
+                                use_regime=v7_regime,
                             )
+                            all_rows.extend(trades)
                 except Exception as e:
-                    dg_errors.append(f"{symbol}: {e}")
+                    errors.append(f"{symbol}: {e}")
 
-                job += 2
-                progress.progress(job / total_jobs)
+                done += len(tests)
+                progress.progress(done / total)
 
             status.empty()
 
-            if dg_trades:
-                dt = pd.DataFrame(dg_trades)
+            if all_rows:
+                dt = pd.DataFrame(all_rows)
 
-                def stats(sub):
-                    wins = int((sub.R > 0).sum())
-                    gp = sub.loc[sub.R > 0, "R"].sum()
-                    gl = abs(sub.loc[sub.R < 0, "R"].sum())
-                    return (
-                        len(sub),
-                        round(100 * wins / len(sub), 2),
-                        round(sub.R.sum(), 3),
-                        round(gp / gl, 3) if gl else float("inf"),
-                        round(sub.R.mean(), 4),
-                    )
-
-                rows = []
-                for d in ["LONG", "SHORT"]:
-                    s = dt[dt.Direction == d]
-                    if len(s):
-                        n, w, nr, pf, av = stats(s)
-                        rows.append({
-                            "Direction": d,
-                            "Trades": n,
-                            "Win Rate %": w,
-                            "Net R": nr,
-                            "Profit Factor": pf,
-                            "Avg R": av,
-                        })
-
-                st.markdown("### V6 LONG vs SHORT")
-                st.dataframe(
-                    pd.DataFrame(rows),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                dt["Score Band"] = pd.cut(
-                    dt.Score,
-                    bins=[54, 59, 64, 69, 74, 79, 84, 89, 100],
-                    labels=[
-                        "55–59", "60–64", "65–69", "70–74",
-                        "75–79", "80–84", "85–89", "90+"
-                    ],
-                    include_lowest=True,
-                )
-
-                rows = []
-                for (direction, band), s in dt.groupby(
-                    ["Direction", "Score Band"], observed=False
+                matrix = []
+                for (direction, lo, hi), s in dt.groupby(
+                    ["Direction", "Score"], observed=False
                 ):
-                    if len(s):
-                        n, w, nr, pf, av = stats(s)
-                        rows.append({
-                            "Direction": direction,
-                            "Score Band": str(band),
-                            "Trades": n,
-                            "Win Rate %": w,
-                            "Net R": nr,
-                            "Profit Factor": pf,
-                            "Avg R": av,
-                        })
+                    pass
 
-                st.markdown("### V6 Direction + Score-band diagnosis")
+                # Reconstruct test label from direction + score.
+                def label(row):
+                    if row["Direction"] == "SHORT" and 65 <= row["Score"] <= 69:
+                        return "SHORT 65–69"
+                    if row["Direction"] == "LONG" and 90 <= row["Score"] <= 100:
+                        return "LONG 90+"
+                    if row["Direction"] == "SHORT" and 70 <= row["Score"] <= 100:
+                        return "SHORT 70+"
+                    if row["Direction"] == "LONG" and 75 <= row["Score"] <= 100:
+                        return "LONG 75+"
+                    if row["Direction"] == "SHORT" and 55 <= row["Score"] <= 64:
+                        return "SHORT 55–64"
+                    if row["Direction"] == "LONG" and 55 <= row["Score"] <= 74:
+                        return "LONG 55–74"
+                    return "Other"
+
+                dt["Test"] = dt.apply(label, axis=1)
+                dt = dt[dt["Test"] != "Other"].copy()
+
+                summary_rows = []
+                for test, s in dt.groupby("Test"):
+                    stt = v7_stats(s)
+                    summary_rows.append({"Test": test, **stt})
+
+                summary_df = pd.DataFrame(summary_rows)
+                st.markdown("### V7 Focused validation")
+                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+                stock_rows = []
+                for (test, symbol), s in dt.groupby(["Test", "Symbol"]):
+                    stt = v7_stats(s)
+                    stock_rows.append({
+                        "Test": test, "Symbol": symbol, **stt
+                    })
+
+                stock_df = pd.DataFrame(stock_rows)
+                st.markdown("### Stock-level validation")
+                st.dataframe(stock_df, use_container_width=True, hide_index=True)
+
+                # Chronological walk-forward-style check on the focused setups.
+                wf_rows = []
+                for test, s in dt.groupby("Test"):
+                    train, test_df = v7_walkforward_split(s, train_days=15)
+                    tr = v7_stats(train)
+                    te = v7_stats(test_df)
+                    wf_rows.append({
+                        "Test": test,
+                        "Train Trades": tr["Trades"],
+                        "Train Net R": tr["Net R"],
+                        "Train PF": tr["Profit Factor"],
+                        "Test Trades": te["Trades"],
+                        "Test Net R": te["Net R"],
+                        "Test PF": te["Profit Factor"],
+                    })
+
+                st.markdown("### Chronological validation (first 15 days vs remaining days)")
                 st.dataframe(
-                    pd.DataFrame(rows),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                outcome = (
-                    dt.groupby(["Direction", "Outcome"])
-                    .agg(
-                        Trades=("R", "size"),
-                        Net_R=("R", "sum"),
-                        Avg_R=("R", "mean"),
-                    )
-                    .reset_index()
-                )
-                outcome[["Net_R", "Avg_R"]] = outcome[
-                    ["Net_R", "Avg_R"]
-                ].round(4)
-
-                st.markdown("### V6 Exit diagnosis")
-                st.dataframe(
-                    outcome,
+                    pd.DataFrame(wf_rows),
                     use_container_width=True,
                     hide_index=True,
                 )
 
                 st.download_button(
-                    "⬇️ Download V6 Diagnosis Trades",
+                    "⬇️ Download V7 Validation Trades",
                     dt.to_csv(index=False).encode(),
-                    "intraday_edge_strategy_diagnosis_v6.csv",
+                    "intraday_edge_strategy_validation_v7.csv",
                     "text/csv",
                 )
             else:
-                st.warning("इस period में कोई qualifying setup नहीं मिला.")
+                st.warning("इस period में qualifying validation trade नहीं मिला.")
 
-            if dg_errors:
-                with st.expander("Diagnosis API / data errors"):
-                    for err in dg_errors:
+            if errors:
+                with st.expander("Validation API / data errors"):
+                    for err in errors:
                         st.write(err)
 
 st.divider()

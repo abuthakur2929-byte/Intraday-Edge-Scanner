@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="Intraday Edge Scanner", page_icon="🎯", layout="wide")
 
-st.title("🎯 Intraday Edge Scanner — V7")
+st.title("🎯 Intraday Edge Scanner — V8")
 st.caption("Live NSE research scanner + rule-based backtest • No automatic order placement")
 
 UPSTOX_TOKEN = st.secrets.get("UPSTOX_ANALYTICS_TOKEN", "")
@@ -728,6 +728,100 @@ def v7_backtest_symbol(df, symbol, direction, score_min, score_max,
     return trades
 
 
+
+def v8_precision_backtest(df, symbol, direction="SHORT", min_score=65, max_score=69,
+                         max_hold_bars=24, sl_atr=1.2, target_atr=1.0,
+                         require_regime=True, require_breakdown=True,
+                         require_vwap=True, min_rvol=1.5,
+                         rsi_min=None, rsi_max=None):
+    """V8 precision test. Conditions are explicit, entry is next candle open,
+    and only one active position per stock is allowed. Designed to test whether
+    higher selectivity can improve hit rate without look-ahead."""
+    if df.empty:
+        return []
+    work = add_indicators(df)
+    trades = []
+    i = 220
+    while i < len(work) - 1:
+        row = work.iloc[i]
+        score = score_direction(row, direction)
+        if score is None or score < min_score or score > max_score:
+            i += 1
+            continue
+
+        if direction == "SHORT":
+            if require_regime and not (row["EMA50"] < row["EMA200"]):
+                i += 1; continue
+            if require_breakdown and not bool(row["Breakdown"]):
+                i += 1; continue
+            if require_vwap and not (row["Close"] < row["VWAP"]):
+                i += 1; continue
+            if row["RVOL"] < min_rvol:
+                i += 1; continue
+        else:
+            if require_regime and not (row["EMA50"] > row["EMA200"]):
+                i += 1; continue
+            if require_breakdown and not bool(row["Breakout"]):
+                i += 1; continue
+            if require_vwap and not (row["Close"] > row["VWAP"]):
+                i += 1; continue
+            if row["RVOL"] < min_rvol:
+                i += 1; continue
+
+        if rsi_min is not None and float(row["RSI14"]) < rsi_min:
+            i += 1; continue
+        if rsi_max is not None and float(row["RSI14"]) > rsi_max:
+            i += 1; continue
+
+        entry_idx = i + 1
+        entry_row = work.iloc[entry_idx]
+        entry = float(entry_row["Open"])
+        atr = float(row["ATR14"])
+        if not np.isfinite(atr) or atr <= 0:
+            i += 1; continue
+
+        if direction == "SHORT":
+            sl = entry + sl_atr * atr
+            target = entry - target_atr * atr
+        else:
+            sl = entry - sl_atr * atr
+            target = entry + target_atr * atr
+
+        exit_idx = min(len(work) - 1, entry_idx + max_hold_bars)
+        exit_price = None; exit_time = None; outcome = "TIME_EXIT"
+        for j in range(entry_idx, exit_idx + 1):
+            bar = work.iloc[j]
+            if direction == "SHORT":
+                hit_sl = bar["High"] >= sl; hit_target = bar["Low"] <= target
+            else:
+                hit_sl = bar["Low"] <= sl; hit_target = bar["High"] >= target
+            if hit_sl and hit_target:
+                exit_price = sl; outcome = "SL"
+            elif hit_sl:
+                exit_price = sl; outcome = "SL"
+            elif hit_target:
+                exit_price = target; outcome = "TARGET"
+            if exit_price is not None:
+                exit_time = bar["Datetime"]; break
+
+        if exit_price is None:
+            exit_price = float(work.iloc[exit_idx]["Close"])
+            exit_time = work.iloc[exit_idx]["Datetime"]
+
+        pnl_r = ((entry - exit_price) / (sl_atr * atr) if direction == "SHORT"
+                 else (exit_price - entry) / (sl_atr * atr))
+        trades.append({
+            "Symbol": symbol, "Direction": direction, "Score": round(score,1),
+            "Signal Time": row["Datetime"], "Entry Time": entry_row["Datetime"],
+            "Entry": round(entry,2), "SL": round(sl,2), "Target": round(target,2),
+            "Exit": round(exit_price,2), "Exit Time": exit_time,
+            "Outcome": outcome, "R": round(pnl_r,3),
+            "Target_RR": round(target_atr / sl_atr,3),
+            "RVOL": round(float(row["RVOL"]),2), "RSI14": round(float(row["RSI14"]),2),
+        })
+        i = exit_idx + 1
+    return trades
+
 def v7_stats(df):
     if df.empty:
         return {
@@ -756,154 +850,76 @@ def v7_walkforward_split(df, train_days=15):
 
 
 with tab_diagnosis:
-    st.subheader("🧪 Strategy Validation — V7")
-    st.caption(
-        "V7 ka purpose promising score bands ko isolate karke validate karna hai. "
-        "Default mein regime filter OFF hai, taaki score-band effect alag measure ho."
-    )
+    st.subheader("🎯 Precision Strategy Lab — V8")
+    st.caption("V8 ka goal high-selectivity setups ko test karna hai. 70–80% win rate target hai, guarantee nahi. Har test next-candle entry, one-position-per-stock aur conservative same-candle SL rule use karta hai.")
 
-    v7_interval = st.selectbox(
-        "Validation candle interval", [5, 10, 15], index=0, key="v7_interval"
-    )
-    v7_stocks = st.multiselect(
-        "Validation stocks",
-        list(STOCKS.keys()),
-        default=list(STOCKS.keys()),
-        key="v7_stocks",
-    )
-    v7_hold = st.slider(
-        "Maximum holding candles", 6, 48, 24, 3, key="v7_hold"
-    )
-    v7_regime = st.checkbox(
-        "Apply EMA50/EMA200 regime filter",
-        value=False,
-        key="v7_regime",
-    )
-
-    st.markdown("**Focused tests:** SHORT 65–69, LONG 90+, plus broader comparison bands.")
-    if st.button("🧪 Run V7 Validation", type="primary", key="v7_run"):
-        if not v7_stocks:
-            st.warning("कम से कम एक stock select करो.")
+    v8_interval = st.selectbox("Validation candle interval", [5,10,15], index=0, key="v8_interval")
+    v8_stocks = st.multiselect("Validation stocks", list(STOCKS.keys()), default=list(STOCKS.keys()), key="v8_stocks")
+    v8_hold = st.slider("Maximum holding candles", 6, 48, 24, 3, key="v8_hold")
+    v8_direction = st.selectbox("Direction", ["SHORT","LONG"], index=0, key="v8_direction")
+    v8_min_score = st.slider("Minimum score", 55, 90, 65, 5, key="v8_min_score")
+    v8_max_score = st.slider("Maximum score", 55, 100, 69, 1, key="v8_max_score")
+    v8_sl = st.selectbox("Stop-loss ATR", [1.0,1.2,1.5], index=1, key="v8_sl")
+    v8_target = st.selectbox("Target ATR", [0.8,1.0,1.2,1.5,2.0], index=1, key="v8_target")
+    c1,c2,c3 = st.columns(3)
+    with c1: v8_regime = st.checkbox("EMA50/200 regime", True, key="v8_regime")
+    with c2: v8_structure = st.checkbox("Breakout/breakdown", True, key="v8_structure")
+    with c3: v8_vwap = st.checkbox("VWAP alignment", True, key="v8_vwap")
+    v8_rvol = st.selectbox("Minimum RVOL", [1.2,1.5,1.8,2.0], index=1, key="v8_rvol")
+    v8_rsi = st.checkbox("Add RSI filter", False, key="v8_rsi")
+    if v8_rsi:
+        if v8_direction == "SHORT":
+            r1,r2 = st.slider("SHORT RSI range", 20, 55, (28,45), key="v8_rsi_range")
         else:
-            tests = [
-                ("SHORT", 65, 69),
-                ("LONG", 90, 100),
-                ("SHORT", 70, 100),
-                ("LONG", 75, 100),
-                ("SHORT", 55, 64),
-                ("LONG", 55, 74),
-            ]
+            r1,r2 = st.slider("LONG RSI range", 45, 80, (55,72), key="v8_rsi_range")
+    else:
+        r1=r2=None
 
-            all_rows = []
-            errors = []
-            progress = st.progress(0)
-            status = st.empty()
-
-            total = len(v7_stocks) * len(tests)
-            done = 0
-
-            for symbol in v7_stocks:
-                status.write(f"Validating {symbol}...")
+    if st.button("🎯 Run V8 Precision Test", type="primary", key="v8_run"):
+        if not v8_stocks:
+            st.warning("कम से कम एक stock select करो.")
+        elif v8_min_score > v8_max_score:
+            st.warning("Minimum score maximum score से बड़ा नहीं हो सकता.")
+        else:
+            rows=[]; errors=[]; progress=st.progress(0); status=st.empty()
+            for i,symbol in enumerate(v8_stocks):
+                status.write(f"Testing {symbol}...")
                 try:
-                    data = get_historical_data(
-                        STOCKS[symbol],
-                        interval=v7_interval,
-                        days_back=30,
-                    )
+                    data=get_historical_data(STOCKS[symbol], interval=v8_interval, days_back=30)
                     if not data.empty:
-                        for direction, lo, hi in tests:
-                            trades = v7_backtest_symbol(
-                                data, symbol, direction, lo, hi,
-                                max_hold_bars=v7_hold,
-                                use_regime=v7_regime,
-                            )
-                            all_rows.extend(trades)
+                        rows.extend(v8_precision_backtest(
+                            data, symbol, direction=v8_direction,
+                            min_score=v8_min_score, max_score=v8_max_score,
+                            max_hold_bars=v8_hold, sl_atr=v8_sl, target_atr=v8_target,
+                            require_regime=v8_regime, require_breakdown=v8_structure,
+                            require_vwap=v8_vwap, min_rvol=v8_rvol,
+                            rsi_min=r1, rsi_max=r2))
                 except Exception as e:
                     errors.append(f"{symbol}: {e}")
-
-                done += len(tests)
-                progress.progress(done / total)
-
+                progress.progress((i+1)/len(v8_stocks))
             status.empty()
 
-            if all_rows:
-                dt = pd.DataFrame(all_rows)
+            if rows:
+                dt=pd.DataFrame(rows)
+                stt=v7_stats(dt)
+                a,b,c,d,e=st.columns(5)
+                a.metric("Trades",stt["Trades"]); b.metric("Win Rate",f'{stt["Win Rate %"]}%')
+                c.metric("Net R",stt["Net R"]); d.metric("Profit Factor",stt["Profit Factor"]); e.metric("Avg R",stt["Avg R"])
+                st.dataframe(dt.sort_values("Signal Time", ascending=False),use_container_width=True,hide_index=True)
 
-                # Reconstruct test label from direction + score.
-                def label(row):
-                    if row["Direction"] == "SHORT" and 65 <= row["Score"] <= 69:
-                        return "SHORT 65–69"
-                    if row["Direction"] == "LONG" and 90 <= row["Score"] <= 100:
-                        return "LONG 90+"
-                    if row["Direction"] == "SHORT" and 70 <= row["Score"] <= 100:
-                        return "SHORT 70+"
-                    if row["Direction"] == "LONG" and 75 <= row["Score"] <= 100:
-                        return "LONG 75+"
-                    if row["Direction"] == "SHORT" and 55 <= row["Score"] <= 64:
-                        return "SHORT 55–64"
-                    if row["Direction"] == "LONG" and 55 <= row["Score"] <= 74:
-                        return "LONG 55–74"
-                    return "Other"
-
-                dt["Test"] = dt.apply(label, axis=1)
-                dt = dt[dt["Test"] != "Other"].copy()
-
-                summary_rows = []
-                for test, s in dt.groupby("Test"):
-                    stt = v7_stats(s)
-                    summary_rows.append({"Test": test, **stt})
-
-                summary_df = pd.DataFrame(summary_rows)
-                st.markdown("### V7 Focused validation")
-                st.dataframe(summary_df, use_container_width=True, hide_index=True)
-
-                stock_rows = []
-                for (test, symbol), s in dt.groupby(["Test", "Symbol"]):
-                    stt = v7_stats(s)
-                    stock_rows.append({
-                        "Test": test, "Symbol": symbol, **stt
-                    })
-
-                stock_df = pd.DataFrame(stock_rows)
-                st.markdown("### Stock-level validation")
-                st.dataframe(stock_df, use_container_width=True, hide_index=True)
-
-                # Chronological walk-forward-style check on the focused setups.
-                wf_rows = []
-                for test, s in dt.groupby("Test"):
-                    train, test_df = v7_walkforward_split(s, train_days=15)
-                    tr = v7_stats(train)
-                    te = v7_stats(test_df)
-                    wf_rows.append({
-                        "Test": test,
-                        "Train Trades": tr["Trades"],
-                        "Train Net R": tr["Net R"],
-                        "Train PF": tr["Profit Factor"],
-                        "Test Trades": te["Trades"],
-                        "Test Net R": te["Net R"],
-                        "Test PF": te["Profit Factor"],
-                    })
-
-                st.markdown("### Chronological validation (first 15 days vs remaining days)")
-                st.dataframe(
-                    pd.DataFrame(wf_rows),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                st.download_button(
-                    "⬇️ Download V7 Validation Trades",
-                    dt.to_csv(index=False).encode(),
-                    "intraday_edge_strategy_validation_v7.csv",
-                    "text/csv",
-                )
+                # Chronological validation: first 15 calendar days vs remaining days.
+                train,test=v7_walkforward_split(dt,15)
+                wr=[]
+                for name,x in [("First 15 days",train),("Later days",test)]:
+                    z=v7_stats(x); wr.append({"Period":name,**z})
+                st.markdown("### Chronological validation")
+                st.dataframe(pd.DataFrame(wr),use_container_width=True,hide_index=True)
+                st.download_button("⬇️ Download V8 Precision Trades",dt.to_csv(index=False).encode("utf-8"),"intraday_edge_precision_v8.csv","text/csv")
             else:
-                st.warning("इस period में qualifying validation trade नहीं मिला.")
-
+                st.warning("इन conditions पर कोई qualifying setup नहीं मिला.")
             if errors:
-                with st.expander("Validation API / data errors"):
-                    for err in errors:
-                        st.write(err)
+                with st.expander("API / data errors"):
+                    for err in errors: st.write(err)
 
 st.divider()
 st.caption("Research / scanning only • No automatic order placement")

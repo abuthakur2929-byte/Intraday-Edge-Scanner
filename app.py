@@ -829,12 +829,6 @@ with tab_diagnosis:
             if all_rows:
                 dt = pd.DataFrame(all_rows)
 
-                matrix = []
-                for (direction, lo, hi), s in dt.groupby(
-                    ["Direction", "Score"], observed=False
-                ):
-                    pass
-
                 # Reconstruct test label from direction + score.
                 def label(row):
                     if row["Direction"] == "SHORT" and 65 <= row["Score"] <= 69:
